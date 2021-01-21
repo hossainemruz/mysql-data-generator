@@ -1,11 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
-	"math"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ type GeneratorOptions struct {
 	tableNumber  int
 	columnNumber int
 	rowNumber    int
+	overwrite    bool
 }
 
 const (
@@ -35,10 +37,18 @@ const (
 
 var opt = GeneratorOptions{}
 
+var payload []byte
+
 func main() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 
+	if opt.user == "" {
+		opt.user = os.Getenv("USERNAME")
+	}
+	if opt.password == "" {
+		opt.user = os.Getenv("PASSWORD")
+	}
 	err := opt.generateData()
 	if err != nil {
 		panic(err)
@@ -54,30 +64,35 @@ func init() {
 	flag.StringVar(&opt.dbName, "database", "demodata", "Name of the database to create")
 	flag.IntVar(&opt.concurrency, "concurrency", 1, "Number of parallel thread to inject data")
 	flag.IntVar(&opt.tableNumber, "tables", 1, "Number of tables to insert in the database")
-	flag.IntVar(&opt.rowNumber, "rows", 1, "Number of rows to insert in each table")
-	flag.IntVar(&opt.columnNumber, "columns", 2, "Number of columns to insert in the tables")
+	flag.BoolVar(&opt.overwrite, "overwrite", false, "Drop previous database/table (if they exist) before inserting new one.")
+	//flag.IntVar(&opt.rowNumber, "rows", 0, "Number of rows to insert in each table")
+	//flag.IntVar(&opt.columnNumber, "columns", 2, "Number of columns to insert in the tables")
+
+	payload = make([]byte, (1024*1024)/2)
+	rand.Read(payload)
 }
 
 func (opt *GeneratorOptions) generateData() error {
+	startingTime := time.Now()
 	// create the database if it does not exist
 	err := opt.ensureDatabase()
 	if err != nil {
 		return err
 	}
+	// ensure tables
+	for i := 1; i <= opt.tableNumber; i++ {
+		err := opt.ensureTable(fmt.Sprintf("table%d", i))
+		if err != nil {
+			return err
+		}
+	}
 	desiredAmount, err := opt.parseSize()
 	if err != nil {
 		return err
 	}
-
-	fmt.Println("Generating sample data")
-	minTableSize := float64(opt.rowNumber * 1024) // enforce each row should be 1KB
-	tableSize := math.Max(minTableSize, float64(desiredAmount)/float64(opt.tableNumber))
-	fmt.Println("actual: ", float64(desiredAmount)/float64(opt.tableNumber))
-	fmt.Println("minimum: ", minTableSize)
-	fmt.Println("tableSize: ", tableSize)
-
-	requiredTables := int(math.Round(float64(desiredAmount) / tableSize))
-	fmt.Println("required tables: ", requiredTables)
+	fmt.Println("Generating sample data......................")
+	totalRows := desiredAmount / (opt.tableNumber * 1024 * 1024) // 1MB per rows
+	fmt.Println("Number of rows to insert: ", totalRows)
 	// insert tables
 	workerLimiter := make(chan struct{}, opt.concurrency)
 
@@ -94,16 +109,29 @@ func (opt *GeneratorOptions) generateData() error {
 		}
 	}()
 	wg := sync.WaitGroup{}
-	for j := 0; j < requiredTables; j++ {
+	mu := sync.Mutex{}
+	maxActiveWorkers := 0
+	activeWorkers := 0
+	for i := 0; i < totalRows; i++ {
 		workerLimiter <- struct{}{} // stuck if already maximum number of workers are already running
 		wg.Add(1)
 		go func() {
 			// start a worker
 			defer wg.Done()
-			err := opt.createTable(randSeq(10), tableSize)
-			if err != nil {
-				fmt.Println("Failed to create a table. Reason: ", err)
+			mu.Lock()
+			activeWorkers++
+			if activeWorkers > maxActiveWorkers {
+				maxActiveWorkers = activeWorkers
 			}
+			mu.Unlock()
+			tableName := fmt.Sprintf("table%d", (rand.Int()%opt.tableNumber)+1)
+			err := opt.insertRow(tableName)
+			if err != nil {
+				fmt.Printf("Failed to insert a row in table: %q. Reason: %v.\n", tableName, err)
+			}
+			mu.Lock()
+			activeWorkers--
+			mu.Unlock()
 			<-workerLimiter // worker has done it's work. so release the seat.
 		}()
 	}
@@ -113,6 +141,19 @@ func (opt *GeneratorOptions) generateData() error {
 	done <- true
 	// show final percentage
 	fmt.Println("Successfully inserted demo data....")
+	totalTime := time.Since(startingTime)
+	curSize, err := opt.getDatabaseSize()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("\n=========================== Summery ===========================")
+	fmt.Printf("%35s: %s\n", "Total data inserted", formatSize(curSize-initialSize))
+	fmt.Printf("%35s: %s\n", "Total time taken", totalTime.String())
+	fmt.Printf("%35s: %d\n", "Max simultaneous go-routine", maxActiveWorkers)
+	fmt.Printf("%35s: %s/s\n", "Speed", formatSize((curSize-initialSize)/int(totalTime.Seconds())))
+
+	fmt.Println("\n====================== Current Database Sizes =================")
 	err = opt.showDBSize()
 	if err != nil {
 		return err
@@ -127,12 +168,24 @@ func (opt *GeneratorOptions) ensureDatabase() error {
 	}
 	defer db.Close()
 
+	// See "Important settings" section.
+	db.SetConnMaxLifetime(10 * time.Second)
+	db.SetMaxOpenConns(120)
+	db.SetMaxIdleConns(130)
+
 	// ping database to check the connection
 	fmt.Println("Pinging the database.....")
 	if err := db.Ping(); err != nil {
 		return err
 	}
 	fmt.Println("Ping Succeeded")
+
+	if opt.overwrite {
+		fmt.Printf("Dropping database: %s\n", opt.dbName)
+		if _, err := db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", opt.dbName)); err != nil {
+			return err
+		}
+	}
 
 	// create the database
 	fmt.Printf("Creating database: %q.....\n", opt.dbName)
@@ -147,53 +200,46 @@ func (opt *GeneratorOptions) ensureDatabase() error {
 	return nil
 }
 
-func (opt *GeneratorOptions) createTable(tableName string, tableSize float64) error {
+func (opt *GeneratorOptions) ensureTable(tableName string) error {
 	db, err := opt.getClient(opt.dbName)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	columnNames := make([]string, 0)
-	columnDefinitions := make([]string, 0)
-	for i := 1; i < opt.columnNumber; i++ {
-		columnNames = append(columnNames, fmt.Sprintf("column%d", i))
-		columnDefinitions = append(columnDefinitions, fmt.Sprintf("column%d TEXT", i))
-	}
-
-	rowSize := math.Max(1024, tableSize/float64(opt.rowNumber)) // enforce row size to be minimum 1KB
-	columnSize := int(math.Max(1, math.Round(rowSize/float64(opt.columnNumber-1))))
-	//fmt.Println("rowSize: ", rowSize)
-	//fmt.Println("columnSize: ", columnSize)
 	// create table
-	statement := fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL,%s, PRIMARY KEY (id))", tableName, strings.Join(columnDefinitions, ","))
+	statement := fmt.Sprintf("CREATE TABLE %s (id VARCHAR(256), data MEDIUMTEXT, PRIMARY KEY (id))", tableName)
 	if _, err = db.Exec(statement); err != nil {
 		if !strings.Contains(err.Error(), "already exists") {
-			fmt.Printf("failed to crate table %q. Reason: %v\n", tableName, err)
-			return err
+			return fmt.Errorf("failed to crate table %q. Reason: %v\n", tableName, err)
 		}
 		fmt.Println("Table already exist")
 	}
+	return nil
+}
 
-	// insert rows. each row will have (1KB) data
-	for i := 0; i < opt.rowNumber; i++ {
-		columnsData := make([]string, 0)
-		for j := 0; j < opt.columnNumber-1; j++ {
-			columnsData = append(columnsData, fmt.Sprintf("%q", randSeq(columnSize)))
-		}
-		statement := fmt.Sprintf("INSERT INTO %s (id,%s) VALUES (%d,%s)",
-			tableName,
-			strings.Join(columnNames, ","),
-			i,
-			strings.Join(columnsData, ","),
-		)
-		_, err = db.Exec(statement)
-		if err != nil {
-			fmt.Println(statement)
-			return err
-		}
+func (opt *GeneratorOptions) insertRow(tableName string) error {
+	db, err := opt.getClient(opt.dbName)
+	if err != nil {
+		return err
 	}
-	return opt.showTableSize(tableName)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	defer db.Close()
+
+	statement := fmt.Sprintf("INSERT INTO %s (id,data) VALUES (%q,%q)",
+		tableName,
+		randSeq(10),
+		payload,
+	)
+	_, err = db.Exec(statement)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (opt *GeneratorOptions) showDBSize() error {
@@ -217,7 +263,7 @@ func (opt *GeneratorOptions) showDBSize() error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%20s: %15s\n", string(dbname), formatSize(sizeInByte))
+		fmt.Printf("%35s: %s\n", string(dbname), formatSize(sizeInByte))
 	}
 	return nil
 }
@@ -265,7 +311,7 @@ func (opt *GeneratorOptions) showProgress(initialSize, desiredAmount int, done <
 			dataInserted := curSize - initialSize
 			progress := float64(dataInserted) * 100 / float64(desiredAmount)
 			if curSize > previousSize {
-				fmt.Printf("Current Size (%s): %s Data Inserted: %s Progress: %.3f%%\n", opt.dbName, formatSize(curSize), formatSize(dataInserted), progress)
+				fmt.Printf("Progress: %.2f%% Data Inserted: %s Current %q Size: %s\n", progress, formatSize(dataInserted), opt.dbName, formatSize(curSize))
 				previousSize = curSize
 			}
 		}
@@ -273,14 +319,32 @@ func (opt *GeneratorOptions) showProgress(initialSize, desiredAmount int, done <
 }
 
 func (opt *GeneratorOptions) getDatabaseSize() (int, error) {
-	statement := fmt.Sprintf("SELECT table_schema, round(SUM(data_length + index_length)) FROM information_schema.TABLES WHERE table_schema = %q;", opt.dbName)
 	db, err := opt.getClient(opt.dbName)
 	if err != nil {
 		fmt.Println("failed to create db client. Reason: ", err)
 		return 0, err
 	}
 	defer db.Close()
+	// make sure the table statistics has been updated
+	// refs:
+	// - https://dba.stackexchange.com/questions/236863/wrong-innodb-table-status-size-rows-after-updating-from-mysql-5-7-to-8
+	// - https://dev.mysql.com/doc/refman/8.0/en/check-table.html
+	// - https://dev.mysql.com/doc/refman/8.0/en/analyze-table.html
+	tables := make([]string, 0)
+	for i := 1; i <= opt.tableNumber; i++ {
+		tables = append(tables, fmt.Sprintf("table%d", i))
+	}
+	_, err = db.Query(fmt.Sprintf("CHECK TABLE %s;", strings.Join(tables, ",")))
+	if err != nil {
+		return 0, err
+	}
 
+	_, err = db.Query(fmt.Sprintf("ANALYZE TABLE %s;", strings.Join(tables, ",")))
+	if err != nil {
+		return 0, err
+	}
+
+	statement := fmt.Sprintf("SELECT table_schema, round(SUM(data_length + index_length)) FROM information_schema.TABLES WHERE table_schema = %q;", opt.dbName)
 	rows, err := db.Query(statement)
 	if err != nil {
 		fmt.Println("failed to execute query. Reason: ", err)
@@ -291,11 +355,10 @@ func (opt *GeneratorOptions) getDatabaseSize() (int, error) {
 	var dbname, size sql.RawBytes
 	for rows.Next() {
 		rows.Scan(&dbname, &size)
-		if size!=nil{
-			fmt.Println(string(size))
+		if size != nil {
 			sizeInByte, err := strconv.Atoi(string(size))
 			if err != nil {
-				fmt.Println("Failed parsing size. reason: ",err)
+				fmt.Println("Failed parsing size. reason: ", err)
 				return 0, err
 			}
 			return sizeInByte, nil
@@ -353,10 +416,3 @@ func (opt *GeneratorOptions) parseSize() (int, error) {
 		return 0, fmt.Errorf("expected data unit to one of (KB, MB, GB). Found: %s", dataUnit)
 	}
 }
-
-// X B
-// d = min(X,quarterGB)
-// pgr = d/c
-//
-// table = row * m
-// 268435456 = 256MB
