@@ -16,17 +16,15 @@ import (
 )
 
 type GeneratorOptions struct {
-	size         string
-	host         string
-	port         int
-	user         string
-	password     string
-	concurrency  int
-	dbName       string
-	tableNumber  int
-	columnNumber int
-	rowNumber    int
-	overwrite    bool
+	size        string
+	host        string
+	port        int
+	user        string
+	password    string
+	concurrency int
+	tableNumber int
+	dbName      string
+	overwrite   bool
 }
 
 const (
@@ -38,6 +36,7 @@ const (
 var opt = GeneratorOptions{}
 
 var payload []byte
+var db *sql.DB
 
 func main() {
 	flag.Parse()
@@ -61,12 +60,10 @@ func init() {
 	flag.IntVar(&opt.port, "port", 3306, "Port number where the MySQL is listening")
 	flag.StringVar(&opt.user, "user", "", "Username to use to connect with the database")
 	flag.StringVar(&opt.password, "password", "", "Password to use to connect with the database")
-	flag.StringVar(&opt.dbName, "database", "demodata", "Name of the database to create")
+	flag.StringVar(&opt.dbName, "database", "sampleData", "Name of the database to create")
 	flag.IntVar(&opt.concurrency, "concurrency", 1, "Number of parallel thread to inject data")
 	flag.IntVar(&opt.tableNumber, "tables", 1, "Number of tables to insert in the database")
 	flag.BoolVar(&opt.overwrite, "overwrite", false, "Drop previous database/table (if they exist) before inserting new one.")
-	//flag.IntVar(&opt.rowNumber, "rows", 0, "Number of rows to insert in each table")
-	//flag.IntVar(&opt.columnNumber, "columns", 2, "Number of columns to insert in the tables")
 
 	payload = make([]byte, (1024*1024)/2)
 	rand.Read(payload)
@@ -79,75 +76,66 @@ func (opt *GeneratorOptions) generateData() error {
 	if err != nil {
 		return err
 	}
-	// ensure tables
-	for i := 1; i <= opt.tableNumber; i++ {
-		err := opt.ensureTable(fmt.Sprintf("table%d", i))
-		if err != nil {
-			return err
+	db, err = opt.getClient(opt.dbName)
+	if err != nil {
+		return err
+	}
+	db.SetConnMaxLifetime(24 * time.Hour)
+	db.SetMaxOpenConns(140)
+	//db.SetMaxIdleConns(120)
+	//defer db.Close()
+
+	// create tables
+	for i := 0; i < opt.tableNumber; i++ {
+		tableName := fmt.Sprintf("table%d", i)
+		statement := fmt.Sprintf("CREATE TABLE %s (id int NOT NULL AUTO_INCREMENT PRIMARY KEY,name text, height int, weight int, age int,description Text)", tableName)
+		if _, err = db.Exec(statement); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("failed to crate table %q. Reason: %v\n", tableName, err)
+			}
+			fmt.Println("Table already exist")
 		}
 	}
+
+	// parse desired data size
 	desiredAmount, err := opt.parseSize()
 	if err != nil {
 		return err
 	}
-	fmt.Println("Generating sample data......................")
-	totalRows := desiredAmount / (opt.tableNumber * 1024 * 1024) // 1MB per rows
-	fmt.Println("Number of rows to insert: ", totalRows)
-	// insert tables
-	workerLimiter := make(chan struct{}, opt.concurrency)
 
-	// start separate go routine for showing progress
+	fmt.Println("Generating sample data......................")
 	initialSize, err := opt.getDatabaseSize()
 	if err != nil {
 		return err
 	}
-	done := make(chan bool)
-	go func() {
-		err := opt.showProgress(initialSize, desiredAmount, done)
-		if err != nil {
-			fmt.Println(err)
-		}
-	}()
+
+	// start go routines to insert data in parallel
+	ctx, cancel := context.WithCancel(context.Background())
 	wg := sync.WaitGroup{}
-	mu := sync.Mutex{}
-	maxActiveWorkers := 0
-	activeWorkers := 0
-	for i := 0; i < totalRows; i++ {
-		workerLimiter <- struct{}{} // stuck if already maximum number of workers are already running
+	for i := 0; i < opt.concurrency; i++ {
 		wg.Add(1)
 		go func() {
-			// start a worker
 			defer wg.Done()
-			mu.Lock()
-			activeWorkers++
-			if activeWorkers > maxActiveWorkers {
-				maxActiveWorkers = activeWorkers
-			}
-			mu.Unlock()
-			tableName := fmt.Sprintf("table%d", (rand.Int()%opt.tableNumber)+1)
-			for try := 0; try < 100; try++ {
-				err := opt.insertRow(tableName)
-				// only retry if too many connection
-				if err != nil && strings.Contains(err.Error(), "Too many connections") {
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				break
-			}
-			mu.Lock()
-			activeWorkers--
-			mu.Unlock()
-			<-workerLimiter // worker has done it's work. so release the seat.
+			err := opt.insertRows(ctx)
 			if err != nil {
-				fmt.Printf("Failed to insert a row in table: %q. Reason: %v.\n", tableName, err)
+				fmt.Println("Err: ", err)
 			}
 		}()
 	}
-	// wait for all go routines to complete
+
+	// monitor progress and stop data insertion when 100% completed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			fmt.Println("Stopping data insertion...")
+			cancel()
+		}()
+		opt.monitorProgress(initialSize, desiredAmount)
+	}()
 	wg.Wait()
-	// close the progress routine
-	done <- true
-	// show final percentage
+
+	// show final statistics
 	fmt.Println("Successfully inserted demo data....")
 	totalTime := time.Since(startingTime)
 	curSize, err := opt.getDatabaseSize()
@@ -158,46 +146,41 @@ func (opt *GeneratorOptions) generateData() error {
 	fmt.Println("\n=========================== Summery ===========================")
 	fmt.Printf("%35s: %s\n", "Total data inserted", formatSize(curSize-initialSize))
 	fmt.Printf("%35s: %s\n", "Total time taken", totalTime.String())
-	fmt.Printf("%35s: %d\n", "Max simultaneous go-routine", maxActiveWorkers)
 	fmt.Printf("%35s: %s/s\n", "Speed", formatSize((curSize-initialSize)/int(totalTime.Seconds())))
 
 	fmt.Println("\n====================== Current Database Sizes =================")
-	err = opt.showDBSize()
-	if err != nil {
-		return err
-	}
-	return nil
+	return opt.showDBSizes()
 }
 
 func (opt *GeneratorOptions) ensureDatabase() error {
-	db, err := opt.getClient("mysql")
+	mydb, err := opt.getClient("mysql")
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer mydb.Close()
 
-	// See "Important settings" section.
-	db.SetConnMaxLifetime(2 * time.Second)
-	db.SetMaxOpenConns(120)
-	db.SetMaxIdleConns(130)
+	//set settings
+	//mydb.SetConnMaxLifetime(2 * time.Hour)
+	//mydb.SetMaxOpenConns(opt.concurrency + 10)
+	//mydb.SetMaxIdleConns(120)
 
 	// ping database to check the connection
 	fmt.Println("Pinging the database.....")
-	if err := db.Ping(); err != nil {
+	if err := mydb.Ping(); err != nil {
 		return err
 	}
 	fmt.Println("Ping Succeeded")
 
 	if opt.overwrite {
 		fmt.Printf("Dropping database: %s\n", opt.dbName)
-		if _, err := db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", opt.dbName)); err != nil {
+		if _, err := mydb.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", opt.dbName)); err != nil {
 			return err
 		}
 	}
 
 	// create the database
 	fmt.Printf("Creating database: %q.....\n", opt.dbName)
-	if _, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s;", opt.dbName)); err != nil {
+	if _, err = mydb.Exec(fmt.Sprintf("CREATE DATABASE %s;", opt.dbName)); err != nil {
 		if strings.Contains(err.Error(), "database exists") {
 			fmt.Println("Database already exist")
 			return nil
@@ -208,56 +191,35 @@ func (opt *GeneratorOptions) ensureDatabase() error {
 	return nil
 }
 
-func (opt *GeneratorOptions) ensureTable(tableName string) error {
-	db, err := opt.getClient(opt.dbName)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
+func (opt *GeneratorOptions) insertRows(ctx context.Context) error {
+	//db.SetConnMaxLifetime(2 * time.Hour)
+	//db.SetMaxOpenConns(opt.concurrency + 10)
+	//db.SetMaxIdleConns(120)
 
-	// create table
-	statement := fmt.Sprintf("CREATE TABLE %s (id VARCHAR(256), data MEDIUMTEXT, PRIMARY KEY (id))", tableName)
-	if _, err = db.Exec(statement); err != nil {
-		if !strings.Contains(err.Error(), "already exists") {
-			return fmt.Errorf("failed to crate table %q. Reason: %v\n", tableName, err)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			tableName := fmt.Sprintf("table%d", rand.Int()%opt.tableNumber)
+			statement := fmt.Sprintf("INSERT INTO %s (name,height,weight,age,description) VALUES (%q,%d,%d,%d,%q)",
+				tableName,
+				generateName(),
+				120+rand.Int()%81,
+				30+rand.Int()%201,
+				10+rand.Int()%101,
+				loremIpsum,
+			)
+			_, err := db.Exec(statement)
+			if err != nil {
+				fmt.Printf("Failed to insert row into table: %s. Reason: %v.\n", tableName, err)
+			}
 		}
-		fmt.Println("Table already exist")
 	}
-	return nil
 }
 
-func (opt *GeneratorOptions) insertRow(tableName string) error {
-	db, err := opt.getClient(opt.dbName)
-	if err != nil {
-		return err
-	}
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	defer db.Close()
-
-	statement := fmt.Sprintf("INSERT INTO %s (id,data) VALUES (%q,%q)",
-		tableName,
-		randSeq(10),
-		payload,
-	)
-	_, err = db.Exec(statement)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (opt *GeneratorOptions) showDBSize() error {
+func (opt *GeneratorOptions) showDBSizes() error {
 	statement := fmt.Sprintf("SELECT table_schema, round(SUM(data_length + index_length)) FROM information_schema.TABLES GROUP BY table_schema")
-	db, err := opt.getClient("mysql")
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
 	rows, err := db.Query(statement)
 	if err != nil {
 		return err
@@ -266,7 +228,10 @@ func (opt *GeneratorOptions) showDBSize() error {
 
 	var dbname, size sql.RawBytes
 	for rows.Next() {
-		rows.Scan(&dbname, &size)
+		err := rows.Scan(&dbname, &size)
+		if err != nil {
+			return err
+		}
 		sizeInByte, err := strconv.Atoi(string(size))
 		if err != nil {
 			return err
@@ -278,12 +243,9 @@ func (opt *GeneratorOptions) showDBSize() error {
 
 func (opt *GeneratorOptions) showTableSize(tableName string) error {
 	statement := fmt.Sprintf("SELECT table_schema, round(SUM(data_length + index_length)) FROM information_schema.TABLES WHERE table_schema = %q AND table_name = %q;", opt.dbName, tableName)
-	db, err := opt.getClient(opt.dbName)
-	if err != nil {
-		fmt.Println("failed to create db client. Reason: ", err)
-		return err
-	}
-	defer db.Close()
+	//db.SetConnMaxLifetime(2 * time.Minute)
+	//db.SetMaxOpenConns(10)
+	//db.SetMaxIdleConns(020)
 
 	rows, err := db.Query(statement)
 	if err != nil {
@@ -304,17 +266,17 @@ func (opt *GeneratorOptions) showTableSize(tableName string) error {
 	return nil
 }
 
-func (opt *GeneratorOptions) showProgress(initialSize, desiredAmount int, done <-chan bool) error {
-	ticker := time.NewTicker(5 * time.Second)
+func (opt *GeneratorOptions) monitorProgress(initialSize, desiredAmount int) {
+	fmt.Println("Current Database Size: ", formatSize(initialSize), " Desired Amount to Inject: ", formatSize(desiredAmount))
+	ticker := time.NewTicker(1 * time.Second)
 	previousSize := initialSize
 	for {
 		select {
-		case <-done:
-			return nil
 		case <-ticker.C:
 			curSize, err := opt.getDatabaseSize()
 			if err != nil {
-				return err
+				fmt.Println("Failed to get database size. Reason: ", err)
+				continue
 			}
 			dataInserted := curSize - initialSize
 			progress := float64(dataInserted) * 100 / float64(desiredAmount)
@@ -322,31 +284,28 @@ func (opt *GeneratorOptions) showProgress(initialSize, desiredAmount int, done <
 				fmt.Printf("Progress: %.2f%% Data Inserted: %s Current %q Size: %s\n", progress, formatSize(dataInserted), opt.dbName, formatSize(curSize))
 				previousSize = curSize
 			}
+			if progress >= 100 {
+				fmt.Println("Successfully inserted sample data......")
+				return
+			}
 		}
 	}
 }
 
 func (opt *GeneratorOptions) getDatabaseSize() (int, error) {
-	db, err := opt.getClient(opt.dbName)
-	if err != nil {
-		fmt.Println("failed to create db client. Reason: ", err)
-		return 0, err
-	}
-	defer db.Close()
 	// make sure the table statistics has been updated
 	// refs:
 	// - https://dba.stackexchange.com/questions/236863/wrong-innodb-table-status-size-rows-after-updating-from-mysql-5-7-to-8
 	// - https://dev.mysql.com/doc/refman/8.0/en/check-table.html
 	// - https://dev.mysql.com/doc/refman/8.0/en/analyze-table.html
 	tables := make([]string, 0)
-	for i := 1; i <= opt.tableNumber; i++ {
+	for i := 0; i < opt.tableNumber; i++ {
 		tables = append(tables, fmt.Sprintf("table%d", i))
 	}
-	_, err = db.Query(fmt.Sprintf("CHECK TABLE %s;", strings.Join(tables, ",")))
+	_, err := db.Query(fmt.Sprintf("CHECK TABLE %s;", strings.Join(tables, ",")))
 	if err != nil {
 		return 0, err
 	}
-
 	_, err = db.Query(fmt.Sprintf("ANALYZE TABLE %s;", strings.Join(tables, ",")))
 	if err != nil {
 		return 0, err
@@ -396,31 +355,35 @@ func formatSize(size int) string {
 		return fmt.Sprintf("%.3f GB", float64(size)/OneGB)
 	}
 }
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
+func generateName() string {
+	return fmt.Sprintf("%s %s", strings.Title(adjectives[rand.Int()%totalAdjectives]), strings.Title(nouns[rand.Int()%totalNouns]))
 }
 
 func (opt *GeneratorOptions) parseSize() (int, error) {
-	dataUnit := opt.size[len(opt.size)-2:]
-	unitCount, err := strconv.Atoi(opt.size[0 : len(opt.size)-2])
+	var amount float64
+	var unit string
+	_, err := fmt.Sscanf(opt.size, "%f%s", &amount, &unit)
 	if err != nil {
 		return 0, err
 	}
-	switch dataUnit {
-	case "KB":
-		return unitCount * 1024, nil
-	case "MB":
-		return unitCount * 1024 * 1024, nil
-	case "GB":
-		return unitCount * 1024 * 1024 * 1024, nil
+
+	switch unit {
+	case "KB", "K":
+		return int(amount * 1024), nil
+	case "MB", "Mi":
+		return int(amount * 1024 * 1024), nil
+	case "GB", "Gi":
+		return int(amount * 1024 * 1024 * 1024), nil
 	default:
-		return 0, fmt.Errorf("expected data unit to one of (KB, MB, GB). Found: %s", dataUnit)
+		return 0, fmt.Errorf("expected data unit to one of (KB,K, MB,Mi, GB,Gi). Found: %s", unit)
 	}
 }
+
+var (
+	adjectives      = []string{"affable", "affectionate", "agreeable", "ambitious", "amiable", "amicable", "amusing", "brave", "bright", "broad-minded", "calm", "careful", "charming", "communicative", "compassionate", "conscientious", "considerate", "convivial", "courageous", "courteous", "creative", "decisive", "determined", "diligent", "diplomatic", "discreet", "dynamic", "easygoing", "emotional", "energetic", "enthusiastic", "exuberant", "fair-minded", "faithful", "fearless", "forceful", "frank", "friendly", "funny", "generous", "gentle", "good", "gregarious", "hard-working", "helpful", "honest", "humorous", "imaginative", "impartial", "independent", "intellectual", "intelligent", "intuitive", "inventive", "kind", "loving", "loyal", "modest", "neat", "nice", "optimistic", "passionate", "patient", "persistent", "pioneering", "philosophical", "placid", "plucky", "polite", "powerful", "practical", "pro-active", "quick-witted", "quiet", "rational", "reliable", "reserved", "resourceful", "romantic", "self-confident", "self-disciplined", "sensible", "sensitive", "shy", "sincere", "sociable", "straightforward", "sympathetic", "thoughtful", "tidy", "tough", "unassuming", "understanding", "versatile", "warmhearted", "willing", "witty"}
+	totalAdjectives = 97
+
+	nouns      = []string{"John", "William", "James", "Charles", "George", "Frank", "Joseph", "Thomas", "Henry", "Robert", "Edward", "Harry", "Walter", "Arthur", "Fred", "Albert", "Samuel", "David", "Louis", "Joe", "Charlie", "Clarence", "Richard", "Andrew", "Daniel", "Ernest", "Will", "Jesse", "Oscar", "Lewis", "Peter", "Benjamin", "Frederick", "Willie", "Alfred", "Sam", "Roy", "Herbert", "Jacob", "Tom", "Elmer", "Carl", "Lee", "Howard", "Martin", "Michael", "Bert", "Herman", "Jim", "Francis", "Harvey", "Earl", "Eugene", "Ralph", "Ed", "Claude", "Edwin", "Ben", "Charley", "Paul", "Edgar", "Isaac", "Otto", "Luther", "Lawrence", "Ira", "Patrick", "Guy", "Oliver", "Theodore", "Hugh", "Clyde", "Alexander", "August", "Floyd", "Homer", "Jack", "Leonard", "Horace", "Marion", "Philip", "Allen", "Archie", "Stephen", "Chester", "Willis", "Raymond", "Rufus", "Warren", "Jessie", "Milton", "Alex", "Leo", "Julius", "Ray", "Sidney", "Bernard", "Dan", "Jerry", "Calvin", "Perry", "Dave", "Anthony", "Eddie", "Amos", "Dennis", "Clifford", "Leroy", "Wesley", "Alonzo", "Garfield", "Franklin", "Emil", "Leon", "Nathan", "Harold", "Matthew", "Levi", "Moses", "Everett", "Lester", "Winfield", "Adam", "Lloyd", "Mack", "Fredrick", "Jay", "Jess", "Melvin", "Noah", "Aaron", "Alvin", "Norman", "Gilbert", "Elijah", "Victor", "Gus", "Nelson", "Jasper", "Silas", "Christopher", "Jake", "Mike", "Percy", "Adolph", "Maurice", "Cornelius", "Felix", "Reuben", "Wallace", "Claud", "Roscoe", "Sylvester", "Earnest", "Hiram", "Otis", "Simon", "Willard", "Irvin", "Mark", "Jose", "Wilbur", "Abraham", "Virgil", "Clinton", "Elbert", "Leslie", "Marshall", "Owen", "Wiley", "Anton", "Morris", "Manuel", "Phillip", "Augustus", "Emmett", "Eli", "Nicholas", "Wilson", "Alva", "Harley", "Newton", "Timothy", "Marvin", "Ross", "Curtis", "Edmund", "Jeff", "Elias", "Harrison", "Stanley", "Columbus", "Lon", "Ora", "Ollie", "Russell", "Pearl", "Solomon", "Arch", "Asa", "Clayton", "Enoch", "Irving", "Mathew", "Nathaniel", "Scott", "Hubert", "Lemuel", "Andy", "Ellis", "Emanuel", "Joshua", "Millard", "Vernon", "Wade", "Cyrus", "Miles", "Rudolph", "Sherman", "Austin", "Bill", "Chas", "Lonnie", "Monroe", "Byron", "Edd", "Emery", "Grant", "Jerome", "Max", "Mose", "Steve", "Gordon", "Abe", "Pete", "Chris", "Clark", "Gustave", "Orville", "Lorenzo", "Bruce", "Marcus", "Preston", "Bob", "Dock", "Donald", "Jackson", "Cecil", "Barney", "Delbert", "Edmond", "Anderson", "Christian", "Glenn", "Jefferson", "Luke", "Neal", "Burt", "Ike", "Myron", "Tony", "Conrad", "Joel", "Matt", "Riley", "Vincent", "Emory", "Isaiah", "Nick", "Ezra", "Green", "Juan", "Clifton", "Lucius", "Porter", "Arnold", "Bud", "Jeremiah", "Taylor", "Forrest", "Roland", "Spencer", "Burton", "Don", "Emmet", "Gustav", "Louie", "Morgan", "Ned", "Van", "Ambrose", "Chauncey", "Elisha", "Ferdinand", "General", "Julian", "Kenneth", "Mitchell", "Allie", "Josh", "Judson", "Lyman", "Napoleon", "Pedro", "Berry", "Dewitt", "Ervin", "Forest", "Lynn", "Pink", "Ruben", "Sanford", "Ward", "Douglas", "Ole", "Omer", "Ulysses", "Walker", "Wilbert", "Adelbert", "Benjiman", "Ivan", "Jonas", "Major", "Abner", "Archibald", "Caleb", "Clint", "Dudley", "Granville", "King", "Mary", "Merton", "Antonio", "Bennie", "Carroll", "Freeman", "Josiah", "Milo", "Royal", "Dick", "Earle", "Elza", "Emerson", "Fletcher", "Judge", "Laurence", "Neil", "Roger", "Seth", "Glen", "Hugo", "Jimmie", "Johnnie", "Washington", "Elwood", "Gust", "Harmon", "Jordan", "Simeon", "Wayne", "Wilber", "Clem", "Evan", "Frederic", "Irwin", "Junius", "Lafayette", "Loren", "Madison", "Mason", "Orval", "Abram", "Aubrey", "Elliott", "Hans", "Karl", "Minor", "Wash", "Wilfred", "Allan", "Alphonse", "Dallas", "Dee", "Isiah", "Jason", "Johnny", "Lawson", "Lew", "Micheal", "Orin", "Addison", "Cal", "Erastus", "Francisco", "Hardy", "Lucien", "Randolph", "Stewart", "Vern", "Wilmer", "Zack", "Adrian", "Alvah", "Bertram", "Clay", "Ephraim", "Fritz", "Giles", "Grover", "Harris", "Isom", "Jesus", "Johnie", "Jonathan", "Lucian", "Malcolm", "Merritt", "Otho", "Perley", "Rolla", "Sandy", "Tomas", "Wilford", "Adolphus", "Angus", "Arther", "Carlos", "Cary", "Cassius", "Davis", "Hamilton", "Harve", "Israel", "Leander", "Melville", "Merle", "Murray", "Pleasant", "Sterling", "Steven", "Axel", "Boyd", "Bryant", "Clement", "Erwin", "Ezekiel", "Foster", "Frances", "Geo", "Houston", "Issac", "Jules", "Larkin", "Mat", "Morton", "Orlando", "Pierce", "Prince", "Rollie", "Rollin", "Sim", "Stuart", "Wilburn", "Bennett", "Casper", "Christ", "Dell", "Egbert", "Elmo", "Fay", "Gabriel", "Hector", "Horatio", "Lige", "Saul", "Smith", "Squire", "Tobe", "Tommie", "Wyatt", "Alford", "Alma", "Alton", "Andres", "Burl", "Cicero", "Dean", "Dorsey", "Enos", "Howell", "Lou", "Loyd", "Mahlon", "Nat", "Omar", "Oran", "Parker", "Raleigh", "Reginald", "Rubin", "Seymour", "Wm", "Young", "Benjamine", "Carey", "Carlton", "Eldridge", "Elzie", "Garrett", "Isham", "Johnson", "Larry", "Logan", "Merrill", "Mont", "Oren", "Pierre", "Rex", "Rodney", "Ted", "Webster", "West", "Wheeler", "Willam", "Al", "Aloysius", "Alvie", "Anna", "Art", "Augustine", "Bailey", "Benjaman", "Beverly", "Bishop", "Clair", "Cloyd", "Coleman", "Dana", "Duncan", "Dwight", "Emile", "Evert", "Henderson", "Hunter", "Jean", "Lem", "Luis", "Mathias", "Maynard", "Miguel", "Mortimer", "Nels", "Norris", "Pat", "Phil", "Rush", "Santiago", "Sol", "Sydney", "Thaddeus", "Thornton", "Tim", "Travis", "Truman", "Watson", "Webb", "Wellington", "Winfred", "Wylie", "Alec", "Basil", "Baxter", "Bertrand", "Buford", "Burr", "Cleveland", "Colonel", "Dempsey", "Early", "Ellsworth", "Fate", "Finley", "Gabe", "Garland", "Gerald", "Herschel", "Hezekiah", "Justus", "Lindsey", "Marcellus", "Olaf", "Olin", "Pablo", "Rolland", "Turner", "Verne", "Volney", "Williams", "Almon", "Alois", "Alonza", "Anson", "Authur", "Benton", "Billie", "Cornelious", "Darius", "Denis", "Dillard", "Doctor", "Elvin", "Emma", "Eric", "Evans", "Gideon", "Haywood", "Hilliard", "Hosea", "Lincoln", "Lonzo", "Lucious", "Lum", "Malachi", "Newt", "Noel", "Orie", "Palmer", "Pinkney", "Shirley", "Sumner", "Terry", "Urban", "Uriah", "Valentine", "Waldo", "Warner", "Wong", "Zeb", "Abel", "Alden", "Archer", "Avery", "Carson", "Cullen", "Doc", "Eben", "Elige", "Elizabeth", "Elmore", "Ernst", "Finis", "Freddie", "Godfrey", "Guss", "Hamp", "Hermann", "Isadore", "Isreal", "Jones", "June", "Lacy", "Lafe", "Leland", "Llewellyn", "Ludwig", "Manford", "Maxwell", "Minnie", "Obie", "Octave", "Orrin", "Ossie", "Oswald", "Park", "Parley", "Ramon", "Rice", "Stonewall", "Theo", "Tillman", "Addie", "Aron", "Ashley", "Bernhard", "Bertie", "Berton", "Buster", "Butler", "Carleton", "Carrie", "Clara", "Clarance", "Clare", "Crawford", "Danial", "Dayton", "Dolphus", "Elder", "Ephriam", "Fayette", "Felipe", "Fernando", "Flem", "Florence", "Ford", "Harlan", "Hayes", "Henery", "Hoy", "Huston", "Ida", "Ivory", "Jonah", "Justin", "Lenard", "Leopold", "Lionel", "Manley", "Marquis", "Marshal", "Mart", "Odie", "Olen", "Oral", "Orley", "Otha", "Press", "Price", "Quincy", "Randall", "Rich", "Richmond", "Romeo", "Russel", "Rutherford", "Shade", "Shelby", "Solon", "Thurman", "Tilden", "Troy", "Woodson", "Worth", "Aden", "Alcide", "Alf", "Algie", "Arlie", "Bart", "Bedford", "Benito", "Billy", "Bird", "Birt", "Bruno", "Burley", "Chancy", "Claus", "Cliff", "Clovis", "Connie", "Creed", "Delos", "Duke", "Eber", "Eligah", "Elliot", "Elton", "Emmitt", "Gene", "Golden", "Hal", "Hardin", "Harman", "Hervey", "Hollis", "Ivey", "Jennie", "Len", "Lindsay", "Lonie", "Lyle", "Mac", "Mal", "Math", "Miller", "Orson", "Osborne", "Percival", "Pleas", "Ples", "Rafael", "Raoul", "Roderick", "Rose", "Shelton", "Sid", "Theron", "Tobias", "Toney", "Tyler", "Vance", "Vivian", "Walton", "Watt", "Weaver", "Wilton", "Adolf", "Albin", "Albion", "Allison", "Alpha", "Alpheus", "Anastacio", "Andre", "Annie", "Arlington", "Armand", "Asberry", "Asbury", "Asher", "Augustin", "Auther", "Author", "Ballard", "Blas", "Caesar", "Candido", "Cato", "Clarke", "Clemente", "Colin", "Commodore", "Cora", "Coy", "Cruz", "Curt", "Damon", "Davie", "Delmar", "Dexter", "Dora", "Doss", "Drew", "Edson", "Elam", "Elihu", "Eliza", "Elsie", "Erie", "Ernie", "Ethel", "Ferd", "Friend", "Garry", "Gary", "Grace", "Gustaf", "Hallie", "Hampton", "Harrie", "Hattie", "Hence", "Hillard", "Hollie", "Holmes", "Hope", "Hyman", "Ishmael", "Jarrett", "Jessee", "Joeseph", "Junious", "Kirk", "Levy", "Mervin", "Michel", "Milford", "Mitchel", "Nellie", "Noble", "Obed", "Oda", "Orren", "Ottis", "Rafe", "Redden", "Reese", "Rube", "Ruby", "Rupert", "Salomon", "Sammie", "Sanders", "Soloman", "Stacy", "Stanford", "Stanton", "Thad", "Titus", "Tracy", "Vernie", "Wendell", "Wilhelm", "Willian", "Yee", "Zeke", "Ab", "Abbott", "Agustus", "Albertus", "Almer", "Alphonso", "Alvia", "Artie", "Arvid", "Ashby", "Augusta", "Aurthur", "Babe", "Baldwin", "Barnett", "Bartholomew", "Barton", "Bernie", "Blaine", "Boston", "Brad", "Bradford", "Bradley", "Brooks", "Buck", "Budd", "Ceylon", "Chalmers", "Chesley", "Chin", "Cleo", "Crockett", "Cyril", "Daisy", "Denver", "Dow", "Duff", "Edie", "Edith", "Elick", "Elie", "Eliga", "Eliseo", "Elroy", "Ely", "Ennis", "Enrique", "Erasmus", "Esau", "Everette", "Firman", "Fleming", "Flora", "Gardner", "Gee", "Gorge", "Gottlieb", "Gregorio", "Gregory", "Gustavus", "Halsey", "Handy", "Hardie", "Harl", "Hayden", "Hays", "Hermon", "Hershel", "Holly", "Hosteen", "Hoyt", "Hudson", "Huey", "Humphrey", "Hunt", "Hyrum", "Irven", "Isam", "Ivy", "Jabez", "Jewel", "Jodie", "Judd", "Julious", "Justice", "Katherine", "Kelly", "Kit", "Knute", "Lavern", "Lawyer", "Layton"}
+	totalNouns = 1000
+	loremIpsum = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed quam felis, interdum in porttitor lacinia, ornare id neque. Ut facilisis rutrum dui, in consectetur nisl. Nulla in augue ut velit bibendum tempor nec sed odio. Phasellus quam mi, rhoncus ut vehicula a, sollicitudin imperdiet massa. Mauris eget lacus in tellus semper suscipit nec eget sem."
+)
