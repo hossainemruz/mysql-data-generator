@@ -47,7 +47,7 @@ func main() {
 		opt.user = os.Getenv("USERNAME")
 	}
 	if opt.password == "" {
-		opt.user = os.Getenv("PASSWORD")
+		opt.password = os.Getenv("PASSWORD")
 	}
 	err := opt.generateData()
 	if err != nil {
@@ -59,8 +59,8 @@ func init() {
 	flag.StringVar(&opt.size, "size", "128MB", "Size of the desired database")
 	flag.StringVar(&opt.host, "host", "localhost", "MySQL host address")
 	flag.IntVar(&opt.port, "port", 3306, "Port number where the MySQL is listening")
-	flag.StringVar(&opt.user, "user", "root", "Username to use to connect with the database")
-	flag.StringVar(&opt.password, "password", "admin123", "Password to use to connect with the database")
+	flag.StringVar(&opt.user, "user", "", "Username to use to connect with the database")
+	flag.StringVar(&opt.password, "password", "", "Password to use to connect with the database")
 	flag.StringVar(&opt.dbName, "database", "demodata", "Name of the database to create")
 	flag.IntVar(&opt.concurrency, "concurrency", 1, "Number of parallel thread to inject data")
 	flag.IntVar(&opt.tableNumber, "tables", 1, "Number of tables to insert in the database")
@@ -125,14 +125,22 @@ func (opt *GeneratorOptions) generateData() error {
 			}
 			mu.Unlock()
 			tableName := fmt.Sprintf("table%d", (rand.Int()%opt.tableNumber)+1)
-			err := opt.insertRow(tableName)
-			if err != nil {
-				fmt.Printf("Failed to insert a row in table: %q. Reason: %v.\n", tableName, err)
+			for try := 0; try < 100; try++ {
+				err := opt.insertRow(tableName)
+				// only retry if too many connection
+				if err != nil && strings.Contains(err.Error(), "Too many connections") {
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				break
 			}
 			mu.Lock()
 			activeWorkers--
 			mu.Unlock()
 			<-workerLimiter // worker has done it's work. so release the seat.
+			if err != nil {
+				fmt.Printf("Failed to insert a row in table: %q. Reason: %v.\n", tableName, err)
+			}
 		}()
 	}
 	// wait for all go routines to complete
@@ -169,7 +177,7 @@ func (opt *GeneratorOptions) ensureDatabase() error {
 	defer db.Close()
 
 	// See "Important settings" section.
-	db.SetConnMaxLifetime(10 * time.Second)
+	db.SetConnMaxLifetime(2 * time.Second)
 	db.SetMaxOpenConns(120)
 	db.SetMaxIdleConns(130)
 
