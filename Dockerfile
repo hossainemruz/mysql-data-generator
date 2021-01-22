@@ -9,4 +9,3 @@ RUN set -x \
   && chmod +x /bin/mysql-data-generator
 
 ENTRYPOINT ["mysql-data-generator"]
-

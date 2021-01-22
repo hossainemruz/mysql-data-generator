@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: msysql-data-generator
+  namespace: demo
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: generator
+          image: emruzhossain/mysql-data-generator:latest
+          imagePullPolicy: Always
+          env:
+            - name: USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: my-group-auth
+                  key: username
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-group-auth
+                  key: password
+          args:
+            - "--host=my-group.demo.svc"
+            - "--port=3306"
+            - "--size=5GB"
+            - "--concurrency=1000"
+            # - "--overwrite=true"
+      restartPolicy: Never
