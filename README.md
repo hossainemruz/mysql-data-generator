@@ -24,6 +24,14 @@ Usage of ./mysql-data-generator:
         Number of tables to insert in the database (default 1)
   -user string
         Username to use to connect with the database
+  -caCert string
+        Certificates authority(CA) file is used to contains a list of trusted SSL CAs
+  -clientCert string
+        Server public key certificate file is used to connect encrypted connections
+  -clientKey  string
+        Server private key certificate file is used to connect encrypted connections
+  -requireTLS  bool
+        Require-tls is used to client connection is mandatory or not
 ```
 
 ## Build
@@ -94,4 +102,63 @@ spec:
 ```
 ```bash
 kubectl apply -f ./data-generator.yaml
+```
+**Run Inside Kubernetes Cluster for SSL encrypted server: **
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: msysql-data-generator
+  namespace: demo
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - name: generator
+        image: suaas21/mysql-data-generator:1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: my-group-tls-auth
+              key: username
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: my-group-tls-auth
+              key: password
+        - name: CA_CERT
+          valueFrom:
+            secretKeyRef:
+              name: my-group-tls-client-cert
+              key: ca.crt
+        - name: CLIENT_CERT
+          valueFrom:
+            secretKeyRef:
+              name: my-group-tls-client-cert
+              key: tls.crt
+        - name: CLIENT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: my-group-tls-client-cert
+              key: tls.key
+        volumeMounts:
+        - mountPath: /mysql/certs
+          name: certs-volume
+        args:
+        - "--host=my-group-tls.demo.svc"
+        # - "--user=x509"
+        # - "--password=password"
+        - "--port=3306"
+        - "--size=200Mi"
+        - "--concurrency=30"
+        - "--require-tls=true"
+        # - "--overwrite=true"
+      volumes:
+      - name: certs-volume
+        emptyDir: {}
+      restartPolicy: Never
 ```
