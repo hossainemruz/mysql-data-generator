@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"flag"
 	"fmt"
+	"github.com/go-sql-driver/mysql"
+	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -22,6 +27,10 @@ type GeneratorOptions struct {
 	port        int
 	user        string
 	password    string
+	caCert      string
+	clientCert  string
+	clientKey   string
+	requireTLS  bool
 	concurrency int
 	tableNumber int
 	dbName      string
@@ -32,6 +41,11 @@ const (
 	OneKB = 1024
 	OneMB = 1024 * 1024
 	OneGB = 1024 * 1024 * 1024
+
+	// certs path
+	ca = "/mysql/certs/ca.crt"
+	clientCerts = "/mysql/certs/client.crt"
+	clientKey   = "/mysql/certs/client.key"
 )
 
 var opt = GeneratorOptions{}
@@ -48,6 +62,19 @@ func main() {
 	if opt.password == "" {
 		opt.password = os.Getenv("PASSWORD")
 	}
+
+	if opt.caCert == "" {
+		opt.caCert = os.Getenv("CA_CERT")
+	}
+
+	if opt.clientCert == "" {
+		opt.clientCert = os.Getenv("CLIENT_CERT")
+	}
+
+	if opt.clientKey == "" {
+		opt.clientKey = os.Getenv("CLIENT_KEY")
+	}
+
 	err := opt.generateData()
 	if err != nil {
 		panic(err)
@@ -64,10 +91,19 @@ func init() {
 	flag.IntVar(&opt.concurrency, "concurrency", 1, "Number of parallel thread to inject data")
 	flag.IntVar(&opt.tableNumber, "tables", 1, "Number of tables to insert in the database")
 	flag.BoolVar(&opt.overwrite, "overwrite", false, "Drop previous database/table (if they exist) before inserting new one.")
+	flag.StringVar(&opt.caCert, "ca-cert", "", "Certificates authority(CA) file is used to contains a list of trusted SSL CAs")
+	flag.StringVar(&opt.clientCert, "client-cert", "", "Server public key certificate file is used to connect encrypted connections")
+	flag.StringVar(&opt.clientKey, "ca-key", "", "Server private key certificate file is used to connect encrypted connections")
+	flag.BoolVar(&opt.requireTLS, "require-tls", false, "Require-tls is used to client connection is mandatory or not")
 }
 
 func (opt *GeneratorOptions) generateData() error {
 	startingTime := time.Now()
+
+	if err := opt.storeCerts(); err != nil {
+		return err
+	}
+
 	// create the database if it does not exist
 	err := opt.ensureDatabase()
 	if err != nil {
@@ -77,7 +113,7 @@ func (opt *GeneratorOptions) generateData() error {
 	if err != nil {
 		return err
 	}
-	maxConnection:=int(math.Max(140, float64(opt.concurrency+10)))
+	maxConnection := int(math.Max(140, float64(opt.concurrency+10)))
 	db.SetConnMaxLifetime(24 * time.Hour)
 	db.SetMaxOpenConns(maxConnection)
 	db.SetMaxIdleConns(maxConnection)
@@ -333,12 +369,52 @@ func (opt *GeneratorOptions) getDatabaseSize() (int, error) {
 }
 
 func (opt *GeneratorOptions) getClient(database string) (*sql.DB, error) {
-	dns := fmt.Sprintf("%v:%v@tcp(%v:%v)/%v", opt.user, opt.password, opt.host, opt.port, database)
+	param := "tls=false"
+	if opt.requireTLS {
+		certPool := x509.NewCertPool()
+		certPool.AppendCertsFromPEM([]byte(opt.caCert))
+
+		cert, err := tls.LoadX509KeyPair(clientCerts, clientKey)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// requireTLS custom setup
+		err = mysql.RegisterTLSConfig("custom", &tls.Config{
+			RootCAs: certPool,
+			Certificates: []tls.Certificate{cert},
+		})
+		if err != nil {
+			return nil, err
+		}
+		param = fmt.Sprintf("tls=%s", "custom")
+	}
+
+	dns := fmt.Sprintf("%v:%v@tcp(%v:%v)/%v?%v", opt.user, opt.password, opt.host, opt.port, database, param)
 	db, err := sql.Open("mysql", dns)
 	if err != nil {
 		return nil, err
 	}
 	return db, nil
+}
+
+func (opt *GeneratorOptions) storeCerts() error {
+	// store ca-cert, client-cert and client-key file to '/mysql/certs/' directory
+	if opt.caCert != "" {
+		if err := ioutil.WriteFile(ca, []byte(opt.caCert), os.ModePerm); err != nil {
+			return err
+		}
+	}
+	if opt.clientCert != "" {
+		if err := ioutil.WriteFile(clientCerts, []byte(opt.clientCert), os.ModePerm); err != nil {
+			return err
+		}
+	}
+	if opt.clientKey != "" {
+		if err := ioutil.WriteFile(clientKey, []byte(opt.clientKey), os.ModePerm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func formatSize(size int) string {
